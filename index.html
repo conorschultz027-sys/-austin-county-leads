@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Austin County TX — Motivated Seller Leads</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0f172a;
+      --card:    #1e293b;
+      --border:  #334155;
+      --accent:  #3b82f6;
+      --text:    #f1f5f9;
+      --muted:   #94a3b8;
+      --red:     #ef4444;
+      --yellow:  #eab308;
+      --green:   #22c55e;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── top bar ── */
+    .topbar {
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
+      padding: .75rem 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: .5rem;
+    }
+    .topbar h1 { font-size: 1.1rem; font-weight: 700; }
+    .topbar h1 span { color: var(--accent); }
+    #metaLine { font-size: .75rem; color: var(--muted); }
+
+    /* ── stats ── */
+    .stats {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      padding: 1rem 1.5rem;
+    }
+    .stat {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .75rem 1.25rem;
+      flex: 1;
+      min-width: 110px;
+    }
+    .stat .n { font-size: 2rem; font-weight: 800; line-height: 1.1; }
+    .stat .l { font-size: .72rem; color: var(--muted); margin-top: 3px; }
+
+    /* ── toolbar ── */
+    .toolbar {
+      display: flex;
+      gap: .6rem;
+      flex-wrap: wrap;
+      align-items: center;
+      padding: 0 1.5rem .9rem;
+    }
+    .toolbar input,
+    .toolbar select {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: .4rem .75rem;
+      font-size: .83rem;
+    }
+    .toolbar input { flex: 1; min-width: 200px; }
+    .btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: .4rem 1rem;
+      font-size: .83rem;
+      cursor: pointer;
+      margin-left: auto;
+      white-space: nowrap;
+    }
+    .btn:hover { opacity: .85; }
+
+    /* ── table ── */
+    .wrap { padding: 0 1.5rem 2rem; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .81rem; }
+    thead th {
+      background: var(--card);
+      border-bottom: 2px solid var(--border);
+      padding: .6rem .75rem;
+      text-align: left;
+      color: var(--muted);
+      font-weight: 600;
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+    }
+    thead th:hover { color: var(--text); }
+    tbody tr { border-bottom: 1px solid var(--border); }
+    tbody tr:hover { background: rgba(255,255,255,.03); }
+    tbody td { padding: .55rem .75rem; vertical-align: top; }
+
+    /* score pill */
+    .sc {
+      display: inline-block;
+      font-weight: 700;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: .88rem;
+    }
+    .sc.hi  { background: rgba(239,68,68,.18);  color: #fca5a5; }
+    .sc.mid { background: rgba(234,179,8,.18);  color: #fde68a; }
+    .sc.lo  { background: rgba(34,197,94,.18);  color: #86efac; }
+
+    /* type badge */
+    .badge {
+      display: inline-block;
+      font-size: .68rem;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(148,163,184,.14);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    /* flags */
+    .flags { display: flex; flex-wrap: wrap; gap: 3px; }
+    .flag {
+      font-size: .65rem;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: rgba(59,130,246,.18);
+      color: #93c5fd;
+      white-space: nowrap;
+    }
+
+    /* address */
+    .addr { font-size: .76rem; line-height: 1.45; }
+    .addr .city { color: var(--muted); }
+
+    a.dl { color: var(--accent); text-decoration: none; font-weight: 500; }
+    a.dl:hover { text-decoration: underline; }
+
+    .empty { text-align: center; padding: 4rem; color: var(--muted); }
+
+    footer { text-align: center; padding: 1.5rem; font-size: .72rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>Austin County TX — <span>Motivated Seller Leads</span></h1>
+  <div id="metaLine">Loading…</div>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="toolbar">
+  <input id="q"    type="text"   placeholder="Search owner, address, doc #…" oninput="render()" />
+  <select id="typ" onchange="render()"><option value="">All Types</option></select>
+  <select id="sc"  onchange="render()">
+    <option value="0">All Scores</option>
+    <option value="60">≥ 60</option>
+    <option value="70">≥ 70</option>
+    <option value="80">≥ 80</option>
+    <option value="90">≥ 90</option>
+  </select>
+  <button class="btn" onclick="exportCSV()">⬇ GHL CSV</button>
+</div>
+
+<div class="wrap">
+  <table>
+    <thead>
+      <tr>
+        <th onclick="sort('score')">Score</th>
+        <th onclick="sort('doc_type')">Type</th>
+        <th onclick="sort('filed')">Filed</th>
+        <th onclick="sort('owner')">Owner / Grantor</th>
+        <th>Property Address</th>
+        <th>Mailing Address</th>
+        <th onclick="sort('amount')">Amount</th>
+        <th>Flags</th>
+        <th>Doc Link</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">No records match your filters.</div>
+</div>
+
+<footer id="foot"></footer>
+
+<script>
+let ALL = [], sortCol = "score", sortAsc = false;
+
+async function load() {
+  try {
+    const d = await fetch("records.json?t=" + Date.now()).then(r => r.json());
+    ALL = d.records || [];
+
+    const dr = d.date_range || {};
+    document.getElementById("metaLine").textContent =
+      `Last run: ${d.fetched_at ? new Date(d.fetched_at).toLocaleString() : "—"}  ·  ${dr.from || "?"}–${dr.to || "?"}`;
+
+    // stats
+    const hi = ALL.filter(r => r.score >= 80).length;
+    document.getElementById("stats").innerHTML = [
+      { n: ALL.length,          l: "Total Leads" },
+      { n: hi,                  l: "High Score ≥80" },
+      { n: d.with_address || 0, l: "With Address" },
+      { n: new Set(ALL.map(r => r.cat)).size, l: "Categories" },
+    ].map(s => `<div class="stat"><div class="n">${s.n}</div><div class="l">${s.l}</div></div>`).join("");
+
+    // type filter
+    const sel = document.getElementById("typ");
+    [...new Set(ALL.map(r => r.doc_type).filter(Boolean))].sort().forEach(t => {
+      const o = document.createElement("option");
+      o.value = t;
+      o.textContent = `${t}  (${ALL.filter(r => r.doc_type === t).length})`;
+      sel.appendChild(o);
+    });
+
+    document.getElementById("foot").textContent =
+      `${d.source || "Austin County Clerk – tccsearch.org"}  ·  ${ALL.length} total records`;
+
+    render();
+  } catch(e) {
+    document.getElementById("metaLine").textContent = "Failed to load records.json";
+  }
+}
+
+function sort(col) {
+  sortAsc = (sortCol === col) ? !sortAsc : (col !== "score");
+  sortCol = col;
+  render();
+}
+
+function render() {
+  const q    = document.getElementById("q").value.toLowerCase();
+  const typ  = document.getElementById("typ").value;
+  const minS = +document.getElementById("sc").value || 0;
+
+  let rows = ALL.filter(r => {
+    if (typ && r.doc_type !== typ) return false;
+    if (r.score < minS) return false;
+    if (q) {
+      const hay = [r.owner,r.doc_num,r.prop_address,r.mail_address,r.grantee].join(" ").toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  rows.sort((a,b) => {
+    let av = a[sortCol] ?? "", bv = b[sortCol] ?? "";
+    if (typeof av === "number") return sortAsc ? av-bv : bv-av;
+    return sortAsc ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
+  });
+
+  const tbody = document.getElementById("tbody");
+  const empty = document.getElementById("empty");
+
+  if (!rows.length) { tbody.innerHTML = ""; empty.style.display = ""; return; }
+  empty.style.display = "none";
+
+  tbody.innerHTML = rows.map(r => {
+    const s = r.score || 0;
+    const cls = s >= 80 ? "hi" : s >= 60 ? "mid" : "lo";
+    const amt = r.amount != null ? "$" + Number(r.amount).toLocaleString() : "—";
+    const flags = (r.flags||[]).map(f => `<span class="flag">${x(f)}</span>`).join("");
+    const pa = r.prop_address
+      ? `<div class="addr">${x(r.prop_address)}<br><span class="city">${x(r.prop_city)} ${x(r.prop_zip)}</span></div>`
+      : `<span style="color:var(--muted)">—</span>`;
+    const ma = r.mail_address
+      ? `<div class="addr">${x(r.mail_address)}<br><span class="city">${x(r.mail_city)}, ${x(r.mail_state)} ${x(r.mail_zip)}</span></div>`
+      : `<span style="color:var(--muted)">—</span>`;
+    const lnk = r.clerk_url
+      ? `<a class="dl" href="${x(r.clerk_url)}" target="_blank" rel="noopener">${x(r.doc_num)}</a>`
+      : x(r.doc_num);
+    return `<tr>
+      <td><span class="sc ${cls}">${s}</span></td>
+      <td><span class="badge">${x(r.doc_type)}</span><br><small style="color:var(--muted)">${x(r.cat_label||"")}</small></td>
+      <td style="white-space:nowrap">${x(r.filed||"—")}</td>
+      <td><strong>${x(r.owner||"—")}</strong>${r.grantee?`<br><small style="color:var(--muted)">→ ${x(r.grantee)}</small>`:""}</td>
+      <td>${pa}</td><td>${ma}</td>
+      <td style="white-space:nowrap">${amt}</td>
+      <td><div class="flags">${flags||'<span style="color:var(--muted)">—</span>'}</div></td>
+      <td>${lnk}</td>
+    </tr>`;
+  }).join("");
+}
+
+function exportCSV() {
+  const H = ["First Name","Last Name","Mailing Address","Mailing City","Mailing State","Mailing Zip",
+    "Property Address","Property City","Property State","Property Zip","Lead Type","Document Type",
+    "Date Filed","Document Number","Amount/Debt Owed","Seller Score","Motivated Seller Flags",
+    "Source","Public Records URL"];
+  const rows = ALL.map(r => {
+    const [fn, ln] = splitName(r.owner||"");
+    return [fn,ln,r.mail_address||"",r.mail_city||"",r.mail_state||"",r.mail_zip||"",
+      r.prop_address||"",r.prop_city||"",r.prop_state||"",r.prop_zip||"",
+      r.cat_label||"",r.doc_type||"",r.filed||"",r.doc_num||"",
+      r.amount??""  ,r.score||0,(r.flags||[]).join("; "),
+      "Austin County Clerk – tccsearch.org",r.clerk_url||""];
+  });
+  const csv = [H,...rows].map(row=>row.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(",")).join("\n");
+  const a = Object.assign(document.createElement("a"),{
+    href: URL.createObjectURL(new Blob([csv],{type:"text/csv"})),
+    download: `austin_county_leads_${new Date().toISOString().slice(0,10)}.csv`
+  });
+  a.click();
+}
+
+function splitName(s) {
+  s = s.trim();
+  if (!s) return ["",""];
+  if (s.includes(",")) { const [l,f]=s.split(",",2); return [f.trim(),l.trim()]; }
+  const p = s.split(" ");
+  return p.length===1 ? [p[0],""] : [p.slice(0,-1).join(" "), p[p.length-1]];
+}
+
+function x(s) {
+  return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+load();
+</script>
+</body>
+</html>
