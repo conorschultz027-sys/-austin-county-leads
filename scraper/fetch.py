@@ -1,13 +1,25 @@
 """
-Austin County, TX — Motivated Seller Lead Scraper
-==================================================
-Clerk portal : https://www.tccsearch.org/  (Playwright async)
-Parcel data  : Austin County Appraisal District + PTAD fallback (requests + dbfread)
+Travis County, TX (Austin) — Motivated Seller Lead Scraper
+===========================================================
+Clerk portal : https://www.tccsearch.org/  (requests + BeautifulSoup, HTTP POST)
+Parcel data  : Travis Central Appraisal District bulk export
+
+Why requests instead of Playwright?
+  tccsearch.org has a 60-second session timeout. By the time Playwright
+  launches a browser, navigates, and tries to fill the form the session
+  has already expired. Direct HTTP POST is ~10x faster and bypasses the
+  timeout entirely.
+
+Strategy:
+  1. GET /RealEstate/SearchEntry.aspx  → grab __VIEWSTATE + session cookie
+  2. POST the search form with date range + instrument type
+  3. Parse the GridView HTML results table
+  4. Follow "Next Page" __doPostBack pagination
+  5. Repeat for each target instrument type keyword
 """
 
 from __future__ import annotations
 
-import asyncio
 import csv
 import json
 import logging
@@ -30,12 +42,6 @@ try:
 except ImportError:
     HAS_DBF = False
 
-try:
-    from playwright.async_api import async_playwright
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
-
 # ── logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -53,14 +59,26 @@ for _d in (DASHBOARD, DATA_DIR, CACHE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 # ── config ─────────────────────────────────────────────────────────────────────
-LOOKBACK_DAYS   = int(os.getenv("LOOKBACK_DAYS", "7"))
-HEADLESS        = os.getenv("HEADLESS", "true").lower() != "false"
-CLERK_BASE      = "https://www.tccsearch.org"
-# Try the homepage first — let it redirect to search
-CLERK_HOME      = "https://www.tccsearch.org"
-CLERK_SEARCH    = "https://www.tccsearch.org/RealEstate/SearchEntry.aspx"
-PAGE_TIMEOUT    = 120_000   # 2 minutes — site can be slow
-NAV_TIMEOUT     = 90_000
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))
+CLERK_BASE    = "https://www.tccsearch.org"
+SEARCH_URL    = "https://www.tccsearch.org/RealEstate/SearchEntry.aspx"
+RESULTS_URL   = "https://www.tccsearch.org/RealEstate/SearchResults.aspx"
+REQUEST_DELAY = 1.5   # seconds between requests — be polite
+MAX_PAGES     = 50    # per instrument type
+RETRY_MAX     = 3
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 # ── document types ─────────────────────────────────────────────────────────────
 DOC_TYPES: dict[str, dict[str, Any]] = {
@@ -88,9 +106,9 @@ INSTRUMENT_MAP: dict[str, str] = {
     "NOTICE OF FORECLOSURE": "NOFC", "FORECLOSURE": "NOFC",
     "NOTICE OF TRUSTEE SALE": "NOFC", "SUBSTITUTE TRUSTEE": "NOFC",
     "SUBSTITUTE TRUSTEE'S DEED": "NOFC", "TRUSTEE'S DEED": "NOFC",
-    "TRUSTEE DEED": "NOFC", "DEED OF TRUST - FORECLOSURE": "NOFC",
+    "TRUSTEE DEED": "NOFC",
     "TAX DEED": "TAXDEED", "CONSTABLE TAX DEED": "TAXDEED",
-    "SHERIFF DEED": "TAXDEED", "SHERIFF'S DEED": "TAXDEED",
+    "SHERIFF'S DEED": "TAXDEED", "SHERIFF DEED": "TAXDEED",
     "ABSTRACT OF JUDGMENT": "JUD", "ABSTRACT OF JUDGEMENT": "JUD",
     "JUDGMENT": "JUD", "JUDGEMENT": "JUD",
     "FOREIGN JUDGMENT": "JUD", "FOREIGN JUDGEMENT": "JUD",
@@ -98,10 +116,12 @@ INSTRUMENT_MAP: dict[str, str] = {
     "DOMESTIC JUDGMENT": "DRJUD", "DOMESTIC RELATIONS ORDER": "DRJUD",
     "CORPORATE TAX LIEN": "LNCORPTX", "CORP TAX LIEN": "LNCORPTX",
     "STATE TAX LIEN": "LNCORPTX", "TWC LIEN": "LNCORPTX",
+    "TEXAS WORKFORCE": "LNCORPTX",
     "IRS LIEN": "LNIRS", "FEDERAL TAX LIEN": "LNIRS",
     "FED TAX LIEN": "LNIRS", "NOTICE OF FEDERAL TAX LIEN": "LNIRS",
     "FEDERAL LIEN": "LNFED",
-    "LIEN": "LN", "MECHANIC LIEN": "LNMECH", "MECHANIC'S LIEN": "LNMECH",
+    "LIEN": "LN",
+    "MECHANIC LIEN": "LNMECH", "MECHANIC'S LIEN": "LNMECH",
     "MATERIALMAN LIEN": "LNMECH", "MATERIALMAN'S LIEN": "LNMECH",
     "HOA LIEN": "LNHOA", "HOMEOWNER ASSOCIATION LIEN": "LNHOA",
     "MEDICAID LIEN": "MEDLN", "MEDICAL ASSISTANCE LIEN": "MEDLN",
@@ -112,11 +132,25 @@ INSTRUMENT_MAP: dict[str, str] = {
     "RELEASE OF LIS PENDENS": "RELLP", "RELEASE LIS PENDENS": "RELLP",
 }
 
-SEARCH_TERMS = [
-    "LIS PENDENS", "FORECLOSURE", "TRUSTEE", "TAX DEED",
-    "JUDGMENT", "ABSTRACT", "IRS LIEN", "FEDERAL TAX LIEN",
-    "MECHANIC LIEN", "HOA LIEN", "LIEN", "PROBATE",
-    "LETTERS TESTAMENTARY", "NOTICE OF COMMENCEMENT", "RELEASE LIS PENDENS",
+# Instrument type keywords to search — maps search term → our code
+# We search each one individually to maximise hits
+SEARCH_TERMS: list[tuple[str, str]] = [
+    ("LIS PENDENS",            "LP"),
+    ("NOTICE OF FORECLOSURE",  "NOFC"),
+    ("SUBSTITUTE TRUSTEE",     "NOFC"),
+    ("TAX DEED",               "TAXDEED"),
+    ("ABSTRACT OF JUDGMENT",   "JUD"),
+    ("JUDGMENT",               "JUD"),
+    ("FEDERAL TAX LIEN",       "LNIRS"),
+    ("IRS LIEN",               "LNIRS"),
+    ("STATE TAX LIEN",         "LNCORPTX"),
+    ("MECHANIC",               "LNMECH"),
+    ("HOA LIEN",               "LNHOA"),
+    ("PROBATE",                "PRO"),
+    ("LETTERS TESTAMENTARY",   "PRO"),
+    ("NOTICE OF COMMENCEMENT", "NOC"),
+    ("RELEASE LIS PENDENS",    "RELLP"),
+    ("MEDICAID LIEN",          "MEDLN"),
 ]
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -142,7 +176,7 @@ def map_instrument(raw: str) -> str | None:
 
 def norm_date(raw: str) -> str:
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d/%m/%Y",
-                "%Y%m%d", "%m/%d/%y", "%b %d, %Y", "%B %d, %Y"):
+                "%Y%m%d", "%m/%d/%y", "%b %d %Y", "%B %d, %Y"):
         try:
             return datetime.strptime(raw.strip(), fmt).strftime("%Y-%m-%d")
         except ValueError:
@@ -165,6 +199,30 @@ def name_variants(name: str) -> list[str]:
         variants.add(f"{' '.join(parts[1:])} {parts[0]}")
     return [v for v in variants if v]
 
+def retry_get(session: requests.Session, url: str, **kwargs) -> requests.Response | None:
+    for i in range(RETRY_MAX):
+        try:
+            r = session.get(url, headers=HEADERS, timeout=30, **kwargs)
+            if r.ok:
+                return r
+            log.warning("GET %s → HTTP %s", url, r.status_code)
+        except Exception as e:
+            log.warning("GET attempt %d failed: %s", i + 1, e)
+        time.sleep(2 * (i + 1))
+    return None
+
+def retry_post(session: requests.Session, url: str, data: dict, **kwargs) -> requests.Response | None:
+    for i in range(RETRY_MAX):
+        try:
+            r = session.post(url, data=data, headers={**HEADERS, "Referer": url}, timeout=30, **kwargs)
+            if r.ok:
+                return r
+            log.warning("POST %s → HTTP %s", url, r.status_code)
+        except Exception as e:
+            log.warning("POST attempt %d failed: %s", i + 1, e)
+        time.sleep(2 * (i + 1))
+    return None
+
 # ── scoring ────────────────────────────────────────────────────────────────────
 
 def score_record(rec: dict) -> tuple[int, list[str]]:
@@ -179,7 +237,6 @@ def score_record(rec: dict) -> tuple[int, list[str]]:
         pass
     seen: set[str] = set()
     flags = [f for f in flags if not (f in seen or seen.add(f))]  # type: ignore[func-returns-value]
-
     score = 30
     DISTRESS = {"Lis pendens", "Pre-foreclosure", "Judgment lien",
                 "Tax lien", "Mechanic lien", "Probate / estate", "LLC / corp owner"}
@@ -190,21 +247,26 @@ def score_record(rec: dict) -> tuple[int, list[str]]:
     if amt:
         if   amt > 100_000: score += 15
         elif amt >  50_000: score += 10
-    if "New this week" in flags: score += 5
-    if rec.get("prop_address"):  score += 5
+    if "New this week"    in flags: score += 5
+    if rec.get("prop_address"):     score += 5
     return min(score, 100), flags
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PARCEL LOOKUP
+#  PARCEL LOOKUP  (Travis Central Appraisal District)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ParcelLookup:
-    ACAD_URLS = [
-        "https://austincad.org/data-downloads",
-        "https://austincad.org/downloads",
-        "https://austincad.org/publicdata",
-        "https://austincad.org/GIS",
-        "https://austincad.org",
+    """
+    Travis CAD bulk export sources:
+    1. https://traviscad.org/publicinformation  (official bulk data page)
+    2. PTAD Texas Comptroller fallback
+    """
+
+    TCAD_URLS = [
+        "https://traviscad.org/publicinformation",
+        "https://traviscad.org/downloads",
+        "https://traviscad.org/public-information",
+        "https://traviscad.org",
     ]
 
     def __init__(self):
@@ -235,32 +297,33 @@ class ParcelLookup:
         return None
 
     def _find_dbf(self) -> Path | None:
-        return self._try_acad() or self._try_ptad()
+        return self._try_tcad() or self._try_ptad()
 
-    def _try_acad(self) -> Path | None:
-        cache = CACHE_DIR / "acad_parcels.dbf"
+    def _try_tcad(self) -> Path | None:
+        cache = CACHE_DIR / "tcad_parcels.dbf"
         if cache.exists() and (time.time() - cache.stat().st_mtime) < 86_400:
-            log.info("Using cached ACAD DBF.")
+            log.info("Using cached TCAD DBF.")
             return cache
-        headers = {"User-Agent": "Mozilla/5.0"}
-        for url in self.ACAD_URLS:
+        for url in self.TCAD_URLS:
             try:
-                resp = requests.get(url, timeout=20, headers=headers)
+                log.info("Checking TCAD: %s", url)
+                resp = requests.get(url, timeout=20, headers=HEADERS)
                 if not resp.ok:
                     continue
                 soup = BeautifulSoup(resp.text, "lxml")
                 for a in soup.find_all("a", href=True):
                     href: str = a["href"]
                     if any(kw in href.lower() for kw in
-                           (".dbf", ".zip", "parcel", "apprais", "export", "download", "bulk")):
+                           (".dbf", ".zip", "parcel", "apprais", "export", "download",
+                            "bulk", "owner", "account")):
                         full = href if href.startswith("http") else urljoin(url, href)
-                        dl   = self._download(full, CACHE_DIR / "acad_raw")
+                        dl   = self._download(full, CACHE_DIR / "tcad_raw")
                         if dl:
                             dbf = self._unpack(dl)
                             if dbf:
                                 return dbf
             except Exception as e:
-                log.debug("ACAD %s: %s", url, e)
+                log.debug("TCAD %s: %s", url, e)
         return None
 
     def _try_ptad(self) -> Path | None:
@@ -271,22 +334,21 @@ class ParcelLookup:
         year = datetime.now().year
         for y in (year, year - 1):
             for pat in [
-                "https://comptroller.texas.gov/taxes/property-tax/county-directory/data/austin-county-{y}.zip",
-                "https://comptroller.texas.gov/taxes/property-tax/county-directory/data/austin-{y}.zip",
+                "https://comptroller.texas.gov/taxes/property-tax/county-directory/data/travis-county-{y}.zip",
+                "https://comptroller.texas.gov/taxes/property-tax/county-directory/data/travis-{y}.zip",
             ]:
-                dl = self._download(pat.format(y=y), CACHE_DIR / f"ptad_{y}.zip")
+                dl = self._download(pat.format(y=y), CACHE_DIR / f"ptad_travis_{y}.zip")
                 if dl:
                     dbf = self._unpack(dl)
                     if dbf:
                         return dbf
-        log.warning("All parcel data sources exhausted.")
+        log.warning("All parcel sources exhausted.")
         return None
 
     def _download(self, url: str, dest: Path) -> Path | None:
         try:
             log.info("Downloading: %s", url)
-            with requests.get(url, stream=True, timeout=60,
-                              headers={"User-Agent": "Mozilla/5.0"}) as r:
+            with requests.get(url, stream=True, timeout=90, headers=HEADERS) as r:
                 if r.status_code != 200:
                     return None
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -296,7 +358,7 @@ class ParcelLookup:
             size_kb = dest.stat().st_size / 1024
             return dest if size_kb > 2 else None
         except Exception as e:
-            log.debug("Download error %s: %s", url, e)
+            log.debug("Download %s: %s", url, e)
             return None
 
     def _unpack(self, path: Path) -> Path | None:
@@ -364,252 +426,242 @@ class ParcelLookup:
         log.info("Parcel index: %d owners, %d keys.", count, len(self._index))
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CLERK SCRAPER
+#  CLERK SCRAPER  — direct HTTP POST, no browser needed
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ClerkScraper:
+    """
+    Scrapes tccsearch.org via direct HTTP POST requests.
+
+    Flow per instrument type:
+      1. GET SearchEntry.aspx  → extract __VIEWSTATE, __EVENTVALIDATION, session cookie
+      2. POST SearchEntry.aspx with form data (dates + instrument type)
+      3. If redirected to SearchResults.aspx, parse that page
+      4. Follow __doPostBack pagination until no more pages
+    """
+
     def __init__(self, start: datetime, end: datetime):
-        self.start = start
-        self.end   = end
+        self.start  = start
+        self.end    = end
         self._seen: set[str] = set()
         self.raw:   list[dict] = []
 
-    async def run(self) -> list[dict]:
-        if not HAS_PLAYWRIGHT:
-            log.error("Playwright not installed — skipping clerk scrape.")
-            return []
+    def run(self) -> list[dict]:
+        log.info("Starting HTTP POST clerk scrape …")
 
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=HEADLESS,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-            )
-            page = await ctx.new_page()
-            page.set_default_timeout(PAGE_TIMEOUT)
-
+        for term, hint_code in SEARCH_TERMS:
             try:
-                # ── load the site homepage first to establish session ──────────
-                log.info("Connecting to clerk portal …")
-                try:
-                    await page.goto(
-                        CLERK_HOME,
-                        wait_until="domcontentloaded",
-                        timeout=NAV_TIMEOUT,
-                    )
-                    await page.wait_for_timeout(3_000)
-                    log.info("Homepage loaded: %s", page.url)
-                except Exception as e:
-                    log.warning("Homepage load issue (continuing): %s", e)
-
-                # ── navigate to search page ───────────────────────────────────
-                try:
-                    await page.goto(
-                        CLERK_SEARCH,
-                        wait_until="domcontentloaded",
-                        timeout=NAV_TIMEOUT,
-                    )
-                    await page.wait_for_timeout(3_000)
-                    log.info("Search page loaded: %s", page.url)
-                except Exception as e:
-                    log.warning("Search page load issue (continuing): %s", e)
-
-                # ── broad date search ─────────────────────────────────────────
-                await self._fill_dates(page)
-                if await self._click_search(page):
-                    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
-                    await page.wait_for_timeout(2_000)
-                    recs = await self._harvest_pages(page)
-                    self.raw.extend(recs)
-                    log.info("Broad date search: %d records.", len(recs))
-
-                # ── per-term searches ─────────────────────────────────────────
-                log.info("Running %d per-term searches …", len(SEARCH_TERMS))
-                for term in SEARCH_TERMS:
-                    try:
-                        await page.goto(
-                            CLERK_SEARCH,
-                            wait_until="domcontentloaded",
-                            timeout=NAV_TIMEOUT,
-                        )
-                        await page.wait_for_timeout(1_500)
-                        await self._fill_instrument(page, term)
-                        await self._fill_dates(page)
-                        if not await self._click_search(page):
-                            continue
-                        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
-                        await page.wait_for_timeout(1_500)
-                        recs = await self._harvest_pages(page)
-                        if recs:
-                            log.info("  '%s' → %d records.", term, len(recs))
-                        self.raw.extend(recs)
-                    except Exception as e:
-                        log.warning("Term '%s' failed: %s", term, e)
-                        continue
-
+                recs = self._scrape_term(term, hint_code)
+                if recs:
+                    log.info("  %-30s → %d records", term, len(recs))
+                self.raw.extend(recs)
+                time.sleep(REQUEST_DELAY)
             except Exception as e:
-                log.error("Clerk scraper fatal: %s", e, exc_info=True)
-            finally:
-                await browser.close()
+                log.warning("Term '%s' failed: %s", term, e)
+                continue
 
         log.info("Clerk scrape done: %d raw records.", len(self.raw))
         return self.raw
 
-    # ── form helpers ───────────────────────────────────────────────────────────
-
-    async def _fill_dates(self, page):
-        s = self.start.strftime("%m/%d/%Y")
-        e = self.end.strftime("%m/%d/%Y")
-
-        # Try every known ASP.NET field name pattern
-        pairs = [
-            ("txtFromDate", s), ("txtToDate", e),
-            ("txtDateFrom", s), ("txtDateTo", e),
-            ("txtStartDate", s), ("txtEndDate", e),
-            ("ctl00$ContentPlaceHolder1$txtFromDate", s),
-            ("ctl00$ContentPlaceHolder1$txtToDate", e),
-            ("ctl00$ContentPlaceHolder1$txtDateFrom", s),
-            ("ctl00$ContentPlaceHolder1$txtDateTo", e),
-            ("ctl00$ContentPlaceHolder1$txtStartDate", s),
-            ("ctl00$ContentPlaceHolder1$txtEndDate", e),
-        ]
-        filled = 0
-        for name, val in pairs:
-            try:
-                el = page.locator(f"input[name='{name}'], input[id='{name}']").first
-                if await el.count() > 0:
-                    await el.triple_click()
-                    await el.fill(val)
-                    filled += 1
-            except Exception:
-                pass
-
-        # Generic fallback — any visible text input with "date" in its id/name
-        if filled < 2:
-            try:
-                inputs = page.locator(
-                    "input[type='text'][id*='ate' i], input[type='text'][name*='ate' i]"
-                )
-                n = await inputs.count()
-                if n >= 2:
-                    await inputs.nth(0).fill(s)
-                    await inputs.nth(1).fill(e)
-            except Exception:
-                pass
-
-    async def _fill_instrument(self, page, term: str):
-        for sel in [
-            "input[name*='Instrument' i]", "input[name*='DocType' i]",
-            "input[name*='InstrType' i]",  "#txtInstrumentType",
-            "#txtDocType",                  "input[id*='Instrument' i]",
-        ]:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0:
-                    await el.fill(term)
-                    return
-            except Exception:
-                pass
-        # dropdown fallback
-        for sel in ["select[name*='Instrument' i]", "select[name*='DocType' i]",
-                    "#ddlInstrumentType", "#ddlDocType"]:
-            try:
-                dd = page.locator(sel).first
-                if await dd.count() > 0:
-                    opts = await dd.locator("option").all_text_contents()
-                    match = next((o for o in opts if term in o.upper()), None)
-                    if match:
-                        await dd.select_option(label=match)
-                    return
-            except Exception:
-                pass
-
-    async def _click_search(self, page) -> bool:
-        for sel in [
-            "input[type='submit'][value*='Search' i]",
-            "input[type='button'][value*='Search' i]",
-            "button[type='submit']",
-            "#btnSearch",
-            "#ctl00_ContentPlaceHolder1_btnSearch",
-            "a:has-text('Search')",
-            "button:has-text('Search')",
-        ]:
-            try:
-                btn = page.locator(sel).first
-                if await btn.count() > 0:
-                    await btn.click()
-                    return True
-            except Exception:
-                pass
-        log.warning("Could not find search button.")
-        return False
-
-    # ── pagination + parsing ───────────────────────────────────────────────────
-
-    async def _harvest_pages(self, page) -> list[dict]:
+    def _scrape_term(self, instrument_term: str, hint_code: str) -> list[dict]:
+        """Scrape one instrument type keyword."""
+        session = requests.Session()
         records: list[dict] = []
-        pg = 1
-        while True:
-            html  = await page.content()
-            batch = self._parse_html(html)
-            records.extend(batch)
-            if pg == 1 and not batch:
-                break
-            # next page
-            advanced = False
-            for sel in [
-                "a:has-text('Next')", "a:has-text('>')",
-                "input[value='Next']", "a[href*='Page$Next']",
-                "a[title='Next Page']", ".pagination a:last-child",
-            ]:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.count() > 0 and await btn.is_visible():
-                        await btn.click()
-                        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
-                        await page.wait_for_timeout(1_000)
-                        advanced = True
-                        pg += 1
-                        break
-                except Exception:
-                    pass
-            if not advanced or pg > 100:
-                break
-        return records
 
-    def _parse_html(self, html: str) -> list[dict]:
-        soup = BeautifulSoup(html, "lxml")
-        body = soup.get_text(" ", strip=True).lower()
-        if any(p in body for p in ("no records found", "no results", "0 records", "no data")):
+        # ── Step 1: GET the search page to get ViewState + session ────────────
+        resp = retry_get(session, SEARCH_URL)
+        if not resp:
+            log.warning("Could not reach search page for term '%s'", instrument_term)
             return []
 
+        soup       = BeautifulSoup(resp.text, "lxml")
+        form_state = self._extract_form_state(soup)
+
+        if not form_state.get("__VIEWSTATE"):
+            log.warning("No ViewState found for term '%s' — skipping.", instrument_term)
+            return []
+
+        # ── Step 2: Build and POST the search form ────────────────────────────
+        start_str = self.start.strftime("%m/%d/%Y")
+        end_str   = self.end.strftime("%m/%d/%Y")
+
+        # Find the actual input field names from the form
+        # tccsearch.org uses ContentPlaceHolder1 naming
+        form_data = {
+            **form_state,
+            "__EVENTTARGET":   "",
+            "__EVENTARGUMENT": "",
+        }
+
+        # Try to find date and instrument fields dynamically
+        for inp in soup.find_all("input", {"type": ["text", "hidden"]}):
+            name = inp.get("name", "")
+            name_lower = name.lower()
+            val  = inp.get("value", "")
+
+            # Keep hidden fields (ViewState etc) as-is
+            if inp.get("type") == "hidden":
+                form_data[name] = val
+                continue
+
+            # Date from
+            if any(k in name_lower for k in ("fromdate", "datebegin", "startdate",
+                                              "datefrom", "fromdt", "begdate")):
+                form_data[name] = start_str
+            # Date to
+            elif any(k in name_lower for k in ("todate", "dateend", "enddate",
+                                                "dateto", "todt", "enddt")):
+                form_data[name] = end_str
+            # Instrument type
+            elif any(k in name_lower for k in ("instrument", "instrtype", "doctype",
+                                                "recordtype", "instrcode")):
+                form_data[name] = instrument_term
+            # Grantor / Grantee — leave blank for date+type search
+            elif any(k in name_lower for k in ("grantor", "grantee", "name")):
+                form_data[name] = ""
+
+        # Also look for select dropdowns
+        for sel in soup.find_all("select"):
+            name = sel.get("name", "")
+            name_lower = name.lower()
+            if any(k in name_lower for k in ("instrument", "instrtype", "doctype")):
+                # Try to find the best matching option
+                best_opt = ""
+                for opt in sel.find_all("option"):
+                    opt_text = opt.get_text(strip=True).upper()
+                    if instrument_term in opt_text:
+                        best_opt = opt.get("value", opt.get_text(strip=True))
+                        break
+                form_data[name] = best_opt
+            elif any(k in name_lower for k in ("county", "state")):
+                # Keep default selected value
+                selected = sel.find("option", selected=True)
+                if selected:
+                    form_data[name] = selected.get("value", "")
+
+        # Find and click the search button
+        search_btn = soup.find("input", {"type": "submit"}) or \
+                     soup.find("input", {"type": "button", "value": re.compile(r"search", re.I)}) or \
+                     soup.find("input", {"id": re.compile(r"search", re.I)})
+
+        if search_btn:
+            btn_name = search_btn.get("name", "")
+            btn_val  = search_btn.get("value", "Search")
+            if btn_name:
+                form_data[btn_name] = btn_val
+
+        time.sleep(REQUEST_DELAY)
+
+        # ── Step 3: POST the form ─────────────────────────────────────────────
+        post_resp = retry_post(session, SEARCH_URL, form_data)
+        if not post_resp:
+            return []
+
+        # ── Step 4: Parse results + pagination ────────────────────────────────
+        result_soup = BeautifulSoup(post_resp.text, "lxml")
+
+        # Check if we got redirected to results page or results are inline
+        page_num = 1
+        current_soup = result_soup
+
+        while page_num <= MAX_PAGES:
+            batch = self._parse_results(current_soup, hint_code)
+            records.extend(batch)
+
+            if not batch and page_num == 1:
+                break
+
+            # Look for next page via __doPostBack
+            next_data = self._find_next_page(current_soup, form_state)
+            if not next_data:
+                break
+
+            time.sleep(REQUEST_DELAY)
+            next_resp = retry_post(session, post_resp.url or SEARCH_URL, next_data)
+            if not next_resp:
+                break
+
+            current_soup = BeautifulSoup(next_resp.text, "lxml")
+            page_num += 1
+
+        return records
+
+    def _extract_form_state(self, soup: BeautifulSoup) -> dict:
+        """Extract all hidden ASP.NET form fields."""
+        state: dict[str, str] = {}
+        for hidden in soup.find_all("input", {"type": "hidden"}):
+            name = hidden.get("name", "")
+            val  = hidden.get("value", "")
+            if name:
+                state[name] = val
+        return state
+
+    def _find_next_page(self, soup: BeautifulSoup, base_state: dict) -> dict | None:
+        """Find __doPostBack call for next page link."""
+        # Look for "Next" link or page number link
+        next_patterns = [
+            re.compile(r"next", re.I),
+            re.compile(r">\s*$"),
+            re.compile(r"Page\$Next"),
+        ]
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            text = a.get_text(strip=True)
+            if any(p.search(text) or p.search(href) for p in next_patterns):
+                # Extract __doPostBack arguments
+                m = re.search(r"__doPostBack\('([^']+)','([^']*)'\)", href)
+                if m:
+                    state = dict(base_state)
+                    state["__EVENTTARGET"]   = m.group(1)
+                    state["__EVENTARGUMENT"] = m.group(2)
+                    # Refresh ViewState from current page
+                    new_vs = soup.find("input", {"id": "__VIEWSTATE"})
+                    if new_vs:
+                        state["__VIEWSTATE"] = new_vs.get("value", "")
+                    new_ev = soup.find("input", {"id": "__EVENTVALIDATION"})
+                    if new_ev:
+                        state["__EVENTVALIDATION"] = new_ev.get("value", "")
+                    return state
+
+        # Also check for table pagination controls
+        for td in soup.find_all("td"):
+            for a in td.find_all("a"):
+                href = a.get("href", "")
+                if "Page$" in href or "__doPostBack" in href:
+                    m = re.search(r"__doPostBack\('([^']+)','([^']*)'\)", href)
+                    if m:
+                        state = dict(base_state)
+                        state["__EVENTTARGET"]   = m.group(1)
+                        state["__EVENTARGUMENT"] = m.group(2)
+                        new_vs = soup.find("input", {"id": "__VIEWSTATE"})
+                        if new_vs:
+                            state["__VIEWSTATE"] = new_vs.get("value", "")
+                        return state
+
+        return None
+
+    def _parse_results(self, soup: BeautifulSoup, hint_code: str) -> list[dict]:
+        """Parse results table from a response page."""
+        body = soup.get_text(" ", strip=True).lower()
+        if any(p in body for p in ("no records found", "no results", "0 records")):
+            return []
+
+        # Find best table
         best_tbl, best_n = None, 0
         for tbl in soup.find_all("table"):
-            n = len(tbl.find_all("tr"))
-            if n > best_n:
-                best_tbl, best_n = tbl, n
+            rows = tbl.find_all("tr")
+            td_rows = [r for r in rows if r.find("td")]
+            if len(td_rows) > best_n:
+                best_tbl, best_n = tbl, len(td_rows)
 
-        if best_tbl and best_n >= 2:
-            return self._parse_table(best_tbl)
-        return self._parse_cards(soup)
+        if not best_tbl or best_n < 1:
+            return []
 
-    def _parse_table(self, tbl) -> list[dict]:
-        rows = tbl.find_all("tr")
+        rows = best_tbl.find_all("tr")
         if not rows:
             return []
 
+        # Parse header
         hdr = [c.get_text(strip=True).upper() for c in rows[0].find_all(["th", "td"])]
 
         def cidx(*names: str) -> int | None:
@@ -619,24 +671,26 @@ class ClerkScraper:
                         return i
             return None
 
-        i_num  = cidx("INSTRUMENT NO", "INSTRUMENT NUMBER", "DOC NO", "DOC NUMBER", "INSTR NO", "NUMBER")
+        i_num  = cidx("INSTRUMENT NO", "INSTRUMENT NUMBER", "DOC NO", "DOC NUMBER",
+                       "INSTR NO", "INSTR NUM", "NUMBER", "INSTRUMENT")
         i_type = cidx("INSTRUMENT TYPE", "INSTR TYPE", "DOC TYPE", "TYPE", "RECORD TYPE")
         i_date = cidx("DATE FILED", "FILED DATE", "FILE DATE", "RECORD DATE", "DATE")
-        i_gror = cidx("GRANTOR", "GRANTORS", "OWNER", "FROM", "SELLER")
-        i_gree = cidx("GRANTEE", "GRANTEES", "BUYER", "TO")
-        i_legal= cidx("LEGAL", "LEGAL DESC", "DESCRIPTION", "REMARKS")
-        i_amt  = cidx("AMOUNT", "CONSIDERATION", "DEBT", "VALUE")
+        i_gror = cidx("GRANTOR", "GRANTORS", "OWNER", "FROM", "SELLER", "PARTY 1")
+        i_gree = cidx("GRANTEE", "GRANTEES", "BUYER", "TO", "PARTY 2")
+        i_legal= cidx("LEGAL", "LEGAL DESC", "DESCRIPTION", "REMARKS", "PROPERTY")
+        i_amt  = cidx("AMOUNT", "CONSIDERATION", "DEBT", "VALUE", "TOTAL")
 
         records: list[dict] = []
         for row in rows[1:]:
             cells = row.find_all(["td", "th"])
-            if not cells:
+            if not cells or len(cells) < 2:
                 continue
             try:
                 def ct(idx: int | None) -> str:
                     return "" if (idx is None or idx >= len(cells)) \
                                else cells[idx].get_text(strip=True)
 
+                # grab doc link
                 clerk_url = ""
                 for a in row.find_all("a", href=True):
                     href: str = a["href"]
@@ -653,17 +707,23 @@ class ClerkScraper:
 
                 raw_type = ct(i_type)
                 raw_num  = ct(i_num)
-                if not raw_num:
+
+                # Try extracting doc num from link if cell was empty
+                if not raw_num and clerk_url:
                     m = re.search(r"id=([^&\s]+)", clerk_url, re.I)
                     raw_num = m.group(1) if m else ""
 
+                # Skip empty or already-seen
                 if not raw_num or raw_num in self._seen:
                     continue
                 self._seen.add(raw_num)
 
+                # Use hint_code if instrument type cell is empty
+                doc_code = map_instrument(raw_type) or hint_code
+
                 records.append({
                     "_raw_type": raw_type,
-                    "doc_code":  map_instrument(raw_type),
+                    "doc_code":  doc_code,
                     "doc_num":   raw_num,
                     "filed":     norm_date(ct(i_date)),
                     "owner":     ct(i_gror),
@@ -674,38 +734,7 @@ class ClerkScraper:
                 })
             except Exception as e:
                 log.debug("Row parse error: %s", e)
-        return records
 
-    def _parse_cards(self, soup: BeautifulSoup) -> list[dict]:
-        records: list[dict] = []
-        for div in soup.select(
-            ".result-item, .search-result, .record-row, "
-            "[class*='result'], [class*='record'], [id*='rpt']"
-        ):
-            try:
-                text  = div.get_text(" ", strip=True)
-                m_num = re.search(r"(?:Instrument|Doc|No|#)[:\s#]*([A-Z0-9\-]+)", text, re.I)
-                m_dt  = re.search(r"\d{1,2}/\d{1,2}/\d{4}", text)
-                link  = div.find("a", href=True)
-                href  = link["href"] if link else ""
-                url   = href if href.startswith("http") else urljoin(CLERK_BASE, href)
-                num   = m_num.group(1) if m_num else ""
-                if not num or num in self._seen:
-                    continue
-                self._seen.add(num)
-                records.append({
-                    "_raw_type": "",
-                    "doc_code":  None,
-                    "doc_num":   num,
-                    "filed":     norm_date(m_dt.group() if m_dt else ""),
-                    "owner":     "",
-                    "grantee":   "",
-                    "legal":     text[:300],
-                    "amount":    parse_amount(text),
-                    "clerk_url": url or doc_url(num),
-                })
-            except Exception:
-                pass
         return records
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -782,8 +811,8 @@ def filter_and_enrich(
 def write_json(records: list[dict], start: datetime, end: datetime):
     payload = {
         "fetched_at":   datetime.now(timezone.utc).isoformat(),
-        "source":       "Austin County Clerk – tccsearch.org",
-        "county":       "Austin County, TX",
+        "source":       "Travis County Clerk – tccsearch.org",
+        "county":       "Travis County, TX (Austin)",
         "date_range":   {"from": start.strftime("%Y-%m-%d"), "to": end.strftime("%Y-%m-%d")},
         "total":        len(records),
         "with_address": sum(1 for r in records if r.get("prop_address")),
@@ -812,7 +841,8 @@ def write_ghl_csv(records: list[dict]):
             last, first = full.split(",", 1)
             return first.strip().title(), last.strip().title()
         parts = full.split()
-        return (" ".join(parts[:-1]).title(), parts[-1].title()) if len(parts) > 1 else (parts[0].title(), "")
+        return (" ".join(parts[:-1]).title(), parts[-1].title()) if len(parts) > 1 \
+               else (parts[0].title(), "")
 
     with open(out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
@@ -837,7 +867,7 @@ def write_ghl_csv(records: list[dict]):
                 "Amount/Debt Owed":       "" if r.get("amount") is None else r["amount"],
                 "Seller Score":           r.get("score", 0),
                 "Motivated Seller Flags": "; ".join(r.get("flags", [])),
-                "Source":                 "Austin County Clerk – tccsearch.org",
+                "Source":                 "Travis County Clerk – tccsearch.org",
                 "Public Records URL":     r.get("clerk_url", ""),
             })
     log.info("GHL CSV: %s  (%d rows)", out, len(records))
@@ -846,22 +876,23 @@ def write_ghl_csv(records: list[dict]):
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def main():
+def main():
     log.info("━" * 55)
-    log.info("  Austin County TX — Motivated Seller Lead Scraper")
+    log.info("  Travis County TX (Austin) — Motivated Seller Leads")
     log.info("━" * 55)
-    log.info("Lookback : %d days", LOOKBACK_DAYS)
+    log.info("Lookback: %d days", LOOKBACK_DAYS)
 
     end   = datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)
-    start = (end - timedelta(days=LOOKBACK_DAYS)).replace(hour=0, minute=0, second=0, microsecond=0)
-    log.info("Range    : %s → %s", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    start = (end - timedelta(days=LOOKBACK_DAYS)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    log.info("Range   : %s → %s", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
 
     log.info("Step 1/4 — Parcel data")
     parcel = ParcelLookup()
     parcel.load()
 
     log.info("Step 2/4 — Clerk portal")
-    raw = await ClerkScraper(start, end).run()
+    raw = ClerkScraper(start, end).run()
 
     log.info("Step 3/4 — Filter & enrich")
     records = filter_and_enrich(raw, parcel, start, end)
@@ -875,4 +906,4 @@ async def main():
     log.info("━" * 55)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
