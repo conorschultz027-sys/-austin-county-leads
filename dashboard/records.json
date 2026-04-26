@@ -1,10 +1,10 @@
 {
-  "fetched_at": "2026-04-25T20:48:25.207717+00:00",
+  "fetched_at": "2026-04-26T10:10:27.866443+00:00",
   "source": "Travis County Clerk \u2013 tccsearch.org",
   "county": "Travis County, TX (Austin)",
   "date_range": {
-    "from": "2026-04-18",
-    "to": "2026-04-25"
+    "from": "2026-04-19",
+    "to": "2026-04-26"
   },
   "total": 0,
   "with_address": 0,
